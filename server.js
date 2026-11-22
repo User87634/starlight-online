@@ -18,13 +18,24 @@ app.use(express.static(path.join(__dirname, 'public')));
 
 /* ==================== 常量 ==================== */
 const COLS = 25, ROWS = 14;
-const VIEW_RADIUS = 3;           // 战争迷雾视野（曼哈顿距离）
 const DIRS = [[0,-1],[0,1],[-1,0],[1,0]];
 const TEAMS = ['A', 'B', 'C'];
 const HIGH_SHRINE_CAP = 60;
 const MAP_STONES = 20;
 const MAP_FORESTS = 40;
 const MAP_RIFTS = 3;
+
+// 掉线宽限期：这段时间内回来算重连，超过就把座位交给 AI
+const DISCONNECT_GRACE_MS = Number(process.env.DISCONNECT_GRACE_MS) || 60000;
+// 真人回合超时：这么久没有任何操作，就自动驻守结束回合
+const TURN_TIMEOUT_MS = Number(process.env.TURN_TIMEOUT_MS) || 20000;
+// AI 回合节奏：先停顿一下选好棋子，镜头移到位之后再真正行动
+const AI_THINK_MS = Number(process.env.AI_THINK_MS) || 700;
+const AI_SELECT_PAUSE_MS = Number(process.env.AI_SELECT_PAUSE_MS) || 1100;
+
+const TEAM_NAMES = { A: '蓝方', B: '红方', C: '绿方' };
+function teamName(t) { return TEAM_NAMES[t] || t; }
+function teamLabel(t) { return teamName(t) + '(' + t + ')'; }
 
 const TEAM_COLORS = {
   A: '#2563eb',
@@ -48,12 +59,6 @@ const SHRINE_DEFS = [
   { x: 12, y: 12, isHigh: false },
   { x: 12, y: 3, isHigh: true }
 ];
-
-const HOME_SHRINE_COORDS = {
-  A: { x: 3, y: 3 },
-  B: { x: 21, y: 3 },
-  C: { x: 12, y: 12 }
-};
 
 const NEUTRAL_SPRINGS = [
   { x: 9, y: 3 },
@@ -130,6 +135,8 @@ function createRoom(socket, nick) {
     game: null,
     seq: 0,
     aiTimer: null,
+    aiActTimer: null,
+    turnTimer: null,
     turnLock: false
   };
   rooms.set(code, room);
@@ -199,6 +206,42 @@ function broadcastLobby(room) {
   }
 }
 
+// 把玩家从当前房间摘下来：对局中交给 AI 接管，大厅里则变回空位
+function detachSocket(socket, handToAI) {
+  const room = rooms.get(socket.data.roomCode);
+  if (!room) return null;
+  const team = TEAMS.find(t => room.slots[t].socketId === socket.id) || null;
+
+  if (team) {
+    const slot = room.slots[team];
+    if (slot.disconnectTimer) { clearTimeout(slot.disconnectTimer); slot.disconnectTimer = null; }
+    if (handToAI && room.status === 'playing') {
+      slot.type = 'ai';
+      slot.nick = 'AI-' + team;
+      slot.token = null;
+      slot.socketId = null;
+      slot.connected = true;
+    } else {
+      slot.type = 'empty';
+      slot.token = null;
+      slot.socketId = null;
+      slot.nick = null;
+      slot.connected = true;
+    }
+    if (socket.data.token) tokenIndex.delete(socket.data.token);
+  }
+
+  socket.leave(room.code);
+  socket.data.roomCode = null;
+  socket.data.token = null;
+  socket.data.team = null;
+  clearTurnTimer(room);
+  broadcastLobby(room);
+  if (room.game) broadcast(room);
+  socket.emit('left_room');
+  return { room, team };
+}
+
 
 function serializeFor(team, room, seq, events) {
   const game = room.game;
@@ -231,8 +274,7 @@ function serializeFor(team, room, seq, events) {
     winner: game.winner || null,
     highShrinePool: game.highShrinePool,
     highShrineClosed: game.highShrineClosed,
-    turnInRound: game.turnInRound,
-    selectedUnitId: game.selectedUnitId || null
+    turnInRound: game.turnInRound
   };
 }
 
@@ -249,6 +291,32 @@ function broadcast(room) {
 }
 
 /* ==================== 调度骨架 ==================== */
+function clearTurnTimer(room) {
+  if (room.turnTimer) { clearTimeout(room.turnTimer); room.turnTimer = null; }
+}
+
+// 真人回合计时：到点还没动作就自动驻守，避免挂机把整局拖住
+function scheduleTurnTimer(room) {
+  clearTurnTimer(room);
+  if (room.status !== 'playing' || !room.game || room.game.gameOver) return;
+  const slot = room.slots[room.game.phase];
+  if (!slot || slot.type !== 'human' || slot.connected === false || !slot.socketId) return;
+
+  room.turnTimer = setTimeout(() => {
+    room.turnTimer = null;
+    if (room.status !== 'playing' || !room.game || room.game.gameOver) return;
+    if (room.turnLock) return;                     // 正在切回合，交给正常流程
+    const current = room.slots[room.game.phase];
+    if (!current || current.type !== 'human') return;
+
+    const team = room.game.phase;
+    log(room.game, `【超时】${teamName(team)} ${Math.round(TURN_TIMEOUT_MS / 1000)} 秒未操作，自动驻守。`);
+    const u = room.game.units.find(x => x.alive && x.team === team && !x.hasActed);
+    if (u) afterAction(room, doWait(room.game, u));
+    else afterAction(room, { needsTurnEnd: true });
+  }, TURN_TIMEOUT_MS);
+}
+
 // 一次行动结束后的统一调度：先广播结果 → 若需要切回合 → 延迟 → switchTurn → 若下一家是 AI → 调度 AI
 function afterAction(room, result) {
   broadcast(room);
@@ -261,50 +329,67 @@ function afterAction(room, result) {
     switchTurn(room.game);
     broadcast(room);
     if (room.game.gameOver) { finalizeGame(room); return; }
+    scheduleTurnTimer(room);
     scheduleAI(room);
   }, 1000);
 }
 
 function scheduleAI(room) {
-  if (room.status !== 'playing' || room.game.gameOver) return;
+  if (room.status !== 'playing' || !room.game || room.game.gameOver) return;
   const slot = room.slots[room.game.phase];
   if (slot.type !== 'ai') return;
 
   clearTimeout(room.aiTimer);
+  clearTimeout(room.aiActTimer);
+
+  // 第一拍：先选中这回合要行动的棋子，让镜头先移过去
   room.aiTimer = setTimeout(() => {
-    if (room.status !== 'playing' || room.game.gameOver) return;
+    if (room.status !== 'playing' || !room.game || room.game.gameOver) return;
     const currentTeam = room.game.phase;
     if (room.slots[currentTeam].type !== 'ai') return;
 
-    let result;
-    try {
-      result = aiTakeOneAction(room.game, currentTeam);
-    } catch (e) {
-      console.error('AI error:', e);
-      result = null;
-    }
-    // AI 的 finishAction 内部已把事件入队，且返回 needsTurnEnd
-    if (result && result.needsTurnEnd) {
-      afterAction(room, result);
-    } else if (result && result.actionEnded) {
-      // 裂隙传送等直接结束行动，也走切回合
-      afterAction(room, { needsTurnEnd: true });
-    } else {
-      // AI 没动，兜底：强行 doWait
-      const u = room.game.units.find(x => x.alive && x.team === currentTeam && !x.hasActed);
-      if (u) {
-        const r2 = doWait(room.game, u);
-        afterAction(room, r2);
-      } else {
-        afterAction(room, { needsTurnEnd: true });
+    const u = pickAIActor(room.game, currentTeam);
+    if (!u) { afterAction(room, { needsTurnEnd: true }); return; }
+
+    room.game.aiFocusId = u.id;
+    const last = room.game.aiConsecutive[currentTeam];
+    room.game.aiConsecutive[currentTeam] = { id: u.id, count: (last ? last.count : 0) + 1 };
+    broadcast(room);
+
+    // 第二拍：镜头到位之后，这枚棋子才真正走位、出手
+    room.aiActTimer = setTimeout(() => {
+      room.aiActTimer = null;
+      if (room.status !== 'playing' || !room.game || room.game.gameOver) return;
+      if (room.game.phase !== currentTeam) return;
+      if (room.slots[currentTeam].type !== 'ai') return;
+
+      let result = null;
+      try {
+        result = aiActivate(room.game, u, currentTeam);
+      } catch (e) {
+        console.error('AI error:', e);
       }
-    }
-  }, 1600);
+      if (result && result.needsTurnEnd) {
+        afterAction(room, result);
+        return;
+      }
+      // AI 没动，兜底：强行 doWait
+      const u2 = room.game.units.find(x => x.alive && x.team === currentTeam && !x.hasActed);
+      if (u2) afterAction(room, doWait(room.game, u2));
+      else afterAction(room, { needsTurnEnd: true });
+    }, AI_SELECT_PAUSE_MS);
+  }, AI_THINK_MS);
 }
 
 function finalizeGame(room) {
   room.status = 'over';
   clearTimeout(room.aiTimer);
+  clearTimeout(room.aiActTimer);
+  clearTurnTimer(room);
+  for (const t of TEAMS) {
+    const s = room.slots[t];
+    if (s.disconnectTimer) { clearTimeout(s.disconnectTimer); s.disconnectTimer = null; }
+  }
   // 最终广播（把 gameOver/winner 传出去）
   broadcast(room);
   broadcastLobby(room);
@@ -350,6 +435,7 @@ io.on('connection', (socket) => {
       const old = io.sockets.sockets.get(slot.socketId);
       if (old) { try { old.emit('kicked_by_reconnect'); old.disconnect(true); } catch (e) {} }
     }
+    if (slot.disconnectTimer) { clearTimeout(slot.disconnectTimer); slot.disconnectTimer = null; }
     slot.socketId = socket.id;
     slot.connected = true;
     socket.data.roomCode = code;
@@ -368,6 +454,7 @@ io.on('connection', (socket) => {
       socket.emit('state', snap);
       if (room.status === 'playing' && room.game && room.game.phase === idx.team) {
         room.turnLock = false;
+        scheduleTurnTimer(room);
       }
     }
   });
@@ -400,6 +487,7 @@ io.on('connection', (socket) => {
     }
     broadcast(room);
     broadcastLobby(room);
+    scheduleTurnTimer(room);
     scheduleAI(room);
   });
 
@@ -421,98 +509,62 @@ io.on('connection', (socket) => {
     }
     if (result && result.error) return socket.emit('action_error', result.error);
     afterAction(room, result);
+    // 只移动没结束回合时，重新开始计这 20 秒
+    if (result && !result.needsTurnEnd && !room.game.gameOver) scheduleTurnTimer(room);
   });
 
-  socket.on('leave_room', () => {
-    const room = rooms.get(socket.data.roomCode);
-    if (!room) return;
-    for (const t of TEAMS) {
-      const s = room.slots[t];
-      if (s.socketId === socket.id) {
-        if (s.type === 'human') {
-          s.type = 'empty';
-          s.token = null;
-          s.socketId = null;
-          s.nick = null;
-          s.connected = true;
-          tokenIndex.delete(socket.data.token);
-        }
-        break;
-      }
+  function handleLeave() {
+    const res = detachSocket(socket, true);
+    if (!res) return;
+    const { room, team } = res;
+    if (team && room.status === 'playing' && room.game && !room.game.gameOver &&
+        room.game.phase === team && !room.turnLock) {
+      scheduleAI(room);
     }
-    socket.leave(room.code);
-    socket.data.roomCode = null;
-    socket.data.token = null;
-    socket.data.team = null;
-    broadcastLobby(room);
-    socket.emit('left_room');
-  });
+  }
 
-  socket.on('leave_game', () => {
-    const room = rooms.get(socket.data.roomCode);
-    if (!room) return;
-    const team = socket.data.team;
+  socket.on('leave_room', handleLeave);
 
-    if (room.status === 'playing' && team && room.slots[team].type === 'human') {
-      const slot = room.slots[team];
-      slot.type = 'ai';
-      slot.nick = 'AI-' + team;
-      slot.socketId = null;
-      slot.token = null;
-      slot.connected = true;
-      if (socket.data.token) tokenIndex.delete(socket.data.token);
-
-      socket.leave(room.code);
-      socket.data.roomCode = null;
-      socket.data.token = null;
-      socket.data.team = null;
-
-      broadcastLobby(room);
-      broadcast(room);
-      socket.emit('left_room');
-
-      if (room.game && !room.game.gameOver && room.game.phase === team && !room.turnLock) {
-        scheduleAI(room);
-      }
-      return;
-    }
-
-    for (const t of TEAMS) {
-      const s = room.slots[t];
-      if (s.socketId === socket.id) {
-        if (s.type === 'human') {
-          s.type = 'empty';
-          s.token = null;
-          s.socketId = null;
-          s.nick = null;
-          s.connected = true;
-          tokenIndex.delete(socket.data.token);
-        }
-        break;
-      }
-    }
-    socket.leave(room.code);
-    socket.data.roomCode = null;
-    socket.data.token = null;
-    socket.data.team = null;
-    broadcastLobby(room);
-    socket.emit('left_room');
-  });
+  socket.on('leave_game', handleLeave);
 
   socket.on('disconnect', () => {
     const code = socket.data.roomCode;
     if (!code) return;
     const room = rooms.get(code);
     if (!room) return;
+
+    let team = null;
     for (const t of TEAMS) {
       const s = room.slots[t];
       if (s.socketId === socket.id) {
         s.socketId = null;
         s.connected = false;
+        team = t;
         break;
       }
     }
     broadcastLobby(room);
+    if (!team || room.status !== 'playing' || !room.game || room.game.gameOver) return;
+
+    // 给掉线的人一段宽限期重连，超时才交给 AI
+    const slot = room.slots[team];
+    const token = slot.token;
+    if (slot.disconnectTimer) clearTimeout(slot.disconnectTimer);
+    slot.disconnectTimer = setTimeout(() => {
+      slot.disconnectTimer = null;
+      if (slot.connected || slot.type !== 'human' || room.status !== 'playing') return;
+      slot.type = 'ai';
+      slot.nick = 'AI-' + team;
+      slot.token = null;
+      slot.socketId = null;
+      slot.connected = true;
+      if (token) tokenIndex.delete(token);
+      broadcastLobby(room);
+      broadcast(room);
+      if (room.game && !room.game.gameOver && room.game.phase === team && !room.turnLock) {
+        scheduleAI(room);
+      }
+    }, DISCONNECT_GRACE_MS);
   });
 });
 
@@ -530,8 +582,6 @@ function springAt(game, x, y) { return game.springs.find(s => s.x === x && s.y =
 function isObstacle(game, x, y) { return game.obstacles.has(key(x, y)); }
 function inForest(game, x, y) { return game.forests.has(key(x, y)); }
 function inRift(game, x, y) { return game.rifts.some(r => r.x === x && r.y === y); }
-function isEnemy(a, b) { return a !== b; }
-
 function springUsableBy(spring, team) {
   if (spring.type === 'neutral') return spring.uses > 0;
   return false;
@@ -739,7 +789,7 @@ function dealDamage(game, target, amount, pierce = false) {
     target.isCrippled = null;
     game.events.push({ type: 'popup', x: target.x, y: target.y, text: '-' + amount, color: '#ef4444' });
     game.events.push({ type: 'sound', name: 'death' });
-    log(game, (target.team === 'A' ? '蓝方' : target.team === 'B' ? '红方' : '绿方') + CLASS_DEFS[target.cls].fullName + '陨落');
+    log(game, teamName(target.team) + CLASS_DEFS[target.cls].fullName + '陨落');
   } else {
     game.events.push({ type: 'popup', x: target.x, y: target.y, text: '-' + amount, color: '#ef4444' });
     game.events.push({ type: 'sound', name: 'hit' });
@@ -764,7 +814,7 @@ function tryKnockback(game, attacker, target) {
 
 function handleKillScore(game, winnerTeam) {
   game.score[winnerTeam] += 3;
-  log(game, (winnerTeam === 'A' ? '蓝方' : winnerTeam === 'B' ? '红方' : '绿方') + '击杀英雄，获得 3 分！');
+  log(game, teamName(winnerTeam) + '击杀英雄，获得 3 分！');
   checkGameOver(game);
 }
 
@@ -817,12 +867,12 @@ function doAttack(game, a, d) {
   }
   if (a.cls === 'runesmith' && a.hp >= 3 && d.alive) tryKnockback(game, a, d);
   if (prevAlive && !d.alive) handleKillScore(game, a.team);
-  log(game, (a.team === 'A' ? '蓝方' : a.team === 'B' ? '红方' : '绿方') + CLASS_DEFS[a.cls].fullName + '攻击' + CLASS_DEFS[d.cls].fullName);
+  log(game, teamName(a.team) + CLASS_DEFS[a.cls].fullName + '攻击' + CLASS_DEFS[d.cls].fullName);
   return finishAction(game, a, 'attack');
 }
 
 function doWait(game, u) {
-  log(game, (u.team === 'A' ? '蓝方' : u.team === 'B' ? '红方' : '绿方') + CLASS_DEFS[u.cls].fullName + '驻守调息');
+  log(game, teamName(u.team) + CLASS_DEFS[u.cls].fullName + '驻守调息');
   game.events.push({ type: 'sound', name: 'wait' });
   return finishAction(game, u, 'wait');
 }
@@ -842,7 +892,7 @@ function doHeal(game, p, t) {
 
 function doCapture(game, u, s) {
   s.owner = u.team;
-  log(game, (u.team === 'A' ? '蓝方' : u.team === 'B' ? '红方' : '绿方') + '占领了' + (s.isHigh ? '高级圣坛' : '圣坛'));
+  log(game, teamName(u.team) + '占领了' + (s.isHigh ? '高级圣坛' : '圣坛'));
   game.events.push({ type: 'sound', name: 'capture' });
   return finishAction(game, u, 'capture');
 }
@@ -974,6 +1024,7 @@ function switchTurn(game) {
   const curIdx = TEAMS.indexOf(game.phase);
   game.phase = TEAMS[(curIdx + 1) % 3];
   game.moveOrigin = null;
+  game.aiFocusId = null;
 
   game.units.forEach(u => { u.hasActed = false; });
   game.units.forEach(u => {
@@ -1011,7 +1062,7 @@ function checkGameOver(game) {
   const winnerByScore = TEAMS.find(t => game.score[t] >= 150);
   if (winnerByScore) {
     game.gameOver = true; game.winner = winnerByScore;
-    log(game, `${winnerByScore} 方率先达到 150 分，获得胜利！`);
+    log(game, `${teamLabel(winnerByScore)} 率先达到 150 分，获得胜利！`);
     game.events.push({ type: 'sound', name: 'win' });
     return;
   }
@@ -1019,7 +1070,7 @@ function checkGameOver(game) {
   const aliveTeams = TEAMS.filter(t => game.units.some(u => u.alive && u.team === t));
   if (aliveTeams.length === 1) {
     game.gameOver = true; game.winner = aliveTeams[0];
-    log(game, `${aliveTeams[0]} 方是最后的幸存者，获得胜利！`);
+    log(game, `${teamLabel(aliveTeams[0])} 是最后的幸存者，获得胜利！`);
     game.events.push({ type: 'sound', name: 'win' });
     return;
   }
@@ -1050,8 +1101,7 @@ function createGame(room) {
 
   generateMap(game);
   createUnits(game);
-  const teamNames = { A: '蓝方', B: '红方', C: '绿方' };
-  log(game, `三分秘境开启！${teamNames[startTeam]}(${startTeam}) 先手。`);
+  log(game, `三分秘境开启！${teamLabel(startTeam)} 先手。`);
   settleScoreAndHeal(game, startTeam);
 
   return game;
@@ -1225,6 +1275,11 @@ function evaluateBestMove(game, u, currentTeam) {
 
     const distToEnemy = Math.abs(nx - enemyCenterX) + Math.abs(ny - enemyCenterY);
     const distToTeam = Math.abs(nx - teamCenterX) + Math.abs(ny - teamCenterY);
+        // 【修复】开局如果不知道去哪，就向地图中心靠拢，增加摩擦概率
+    const centerX = COLS / 2;
+    const centerY = ROWS / 2;
+    const distToCenter = Math.abs(nx - centerX) + Math.abs(ny - centerY);
+    score += (20 - distToCenter) * 30; // 越靠近中心分越高
 
     if (unownedShrines.length > 0) {
       let maxShrineScore = -Infinity;
@@ -1447,8 +1502,13 @@ function pickAIActor(game, currentTeam) {
       if (['shield', 'greatsword', 'spear', 'shadow'].includes(b.cls)) scoreB += (15 - (Math.abs(b.x - threatPos.x) + Math.abs(b.y - threatPos.y))) * 200;
     }
 
-    if (last.id === a.id) scoreA += (last.count >= 3) ? -5000 : 500;
-    if (last.id === b.id) scoreB += (last.count >= 3) ? -5000 : 500;
+    // 【修复】刚刚动过的单位，分数大幅降低，逼它换别人上！
+    if (last.id === a.id) scoreA -= 10000;
+    if (last.id === b.id) scoreB -= 10000;
+
+    // 【补丁】鼓励未行动的机动单位先走，别全挤在老家
+    if (a.hasMovedThisRound) scoreA -= 1000;
+    if (b.hasMovedThisRound) scoreB -= 1000;
 
     if (a.hp === 1) scoreA -= 3000;
     if (b.hp === 1) scoreB -= 3000;

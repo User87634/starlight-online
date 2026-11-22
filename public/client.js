@@ -2,11 +2,11 @@
 
 /* ==================== 常量 ==================== */
 const COLS = 25, ROWS = 14, VIEW = 7;
-const VIEW_RADIUS = 3;
 const DIRS = [[0,-1],[0,1],[-1,0],[1,0]];
 const TEAMS = ['A', 'B', 'C'];
 
 const TEAM_COLORS = { A: '#2563eb', B: '#ef4444', C: '#22c55e' };
+const TEAM_NAMES = { A: '蓝方', B: '红方', C: '绿方' };
 const TEAM_COLOR_PALETTE = {
   A: { main: '#2563eb', light: '#60a5fa', glow: '#bfdbfe' },
   B: { main: '#ef4444', light: '#fca5a5', glow: '#fecaca' },
@@ -29,13 +29,12 @@ const local = {
   seq: 0, you: null, phase: null, round: 1,
   score: { A: 0, B: 0, C: 0 },
   units: [], shrines: [], springs: [], obstacles: new Set(), forests: new Set(), rifts: [],
-  log: [], actingUnitId: null, turnLocked: false, gameOver: false, winner: null,
-  highShrinePool: 0, highShrineClosed: false, turnInRound: 0
+  log: [], actingUnitId: null, turnLocked: false, gameOver: false, winner: null
 };
 
 const ui = {
   selectedId: null, mode: 'normal', moveOrigin: null,
-  ctrlDown: false, soundOn: true, intentPending: false,
+  soundOn: true, intentPending: false,
   rosterKey: null, locked: false
 };
 
@@ -761,6 +760,10 @@ function doRender() {
   const sel = getSelected();
   const myTurn = isMyTurn();
   let reach = null, attackTargets = [], healTargets = [], captureShrines = [];
+  // 敌方回合：服务器会先"选中"一枚棋子再让它行动，这里把它标出来
+  const acting = (local.phase !== local.you && local.actingUnitId)
+    ? local.units.find(u => u.id === local.actingUnitId && u.alive)
+    : null;
 
   if (sel && myTurn && !sel.hasActed) {
     if (!sel.hasMovedThisRound) reach = getReachable(sel);
@@ -788,6 +791,7 @@ function doRender() {
       cell.classList.add('selected');
       if (ui.mode === 'spearDir' || ui.mode === 'heal') cell.classList.add('casting');
     }
+    if (acting && acting.x === x && acting.y === y) cell.classList.add('casting');
     if (reach && reach.has(k) && !unitAt(x, y)) cell.classList.add('move-hint');
     if (attackTargets.some(t => t.x === x && t.y === y)) cell.classList.add('attack-hint');
     if (healTargets.some(t => t.x === x && t.y === y)) cell.classList.add('heal-hint');
@@ -823,7 +827,7 @@ function doRender() {
 
   const ti = document.getElementById('turnInfo');
   ti.className = local.phase;
-  ti.textContent = local.phase === local.you ? '你的回合' : `敌方 ${local.phase} 行动中…`;
+  ti.textContent = local.phase === local.you ? '你的回合' : `${TEAM_NAMES[local.phase] || local.phase}行动中…`;
 
   const logEl = document.getElementById('log');
   logEl.innerHTML = local.log.map(m => '<div>' + m + '</div>').join('');
@@ -893,7 +897,7 @@ function renderPanel(sel) {
   }
 
   if (!sel) {
-    info.textContent = myTurn ? '选择一名英雄行动' : (local.gameOver ? '游戏结束' : `等待 ${local.phase} 方行动…`);
+    info.textContent = myTurn ? '选择一名英雄行动' : (local.gameOver ? '游戏结束' : `等待 ${TEAM_NAMES[local.phase] || local.phase}行动…`);
     return;
   }
 
@@ -941,7 +945,7 @@ function showGameOver() {
   const d = document.createElement('div');
   d.className = 'gameover';
   const myWin = local.winner === local.you;
-  const msg = local.winner ? (myWin ? '你胜利了！' : `${local.winner} 方胜利`) : '平局！';
+  const msg = local.winner ? (myWin ? '你胜利了！' : `${TEAM_NAMES[local.winner] || local.winner}胜利`) : '平局！';
   d.innerHTML = `<h2>${msg}</h2><button onclick="location.reload()">返回大厅</button>`;
   document.body.appendChild(d);
   myWin ? SFX.win() : SFX.lose();
@@ -1208,9 +1212,6 @@ function initSocket() {
     local.turnLocked = data.turnLocked;
     local.gameOver = data.gameOver;
     local.winner = data.winner;
-    local.highShrinePool = data.highShrinePool;
-    local.highShrineClosed = data.highShrineClosed;
-    local.turnInRound = data.turnInRound;
 
     if (local.phase !== local.you) ui.mode = 'normal';
 
@@ -1298,11 +1299,40 @@ function init() {
     socket.emit('leave_room');
   };
 
+  // ====== 新增：说明弹窗逻辑（带安全防御） ======
+  const helpModal = document.getElementById('help-modal');
+  const closeHelpBtn = document.getElementById('closeHelpBtn');
+  const lobbyHelpBtn = document.getElementById('lobbyHelpBtn');
+  const gameHelpBtn = document.getElementById('gameHelpBtn');
+
+  if (helpModal) {
+    const openHelp = () => {
+      initAudio(); SFX.click();
+      helpModal.classList.add('show');
+    };
+    const closeHelp = () => {
+      SFX.click();
+      helpModal.classList.remove('show');
+    };
+
+    if (lobbyHelpBtn) lobbyHelpBtn.onclick = openHelp;
+    if (gameHelpBtn) gameHelpBtn.onclick = openHelp;
+    if (closeHelpBtn) closeHelpBtn.onclick = closeHelp;
+
+    helpModal.addEventListener('click', (e) => {
+      if (e.target === helpModal) closeHelp(); // 点击黑色半透明背景也能关闭
+    });
+  } else {
+    console.warn('未找到 help-modal 元素，请检查 index.html 是否更新');
+  }
+  // ================================
+
   document.getElementById('soundBtn').onclick = () => {
     initAudio(); ui.soundOn = !ui.soundOn;
     document.getElementById('soundBtn').textContent = ui.soundOn ? '🔊 音效' : '🔇 静音';
     if (ui.soundOn) SFX.click();
   };
+
   document.getElementById('fullscreenBtn').onclick = () => {
     initAudio();
     if (!document.fullscreenElement) {
@@ -1330,7 +1360,6 @@ function init() {
   });
 
   document.addEventListener('keydown', (e) => {
-    if (e.key === 'Control') ui.ctrlDown = true;
     if (e.code === 'Space' || e.key === ' ') {
       e.preventDefault();
       if (e.repeat) return;
@@ -1340,7 +1369,6 @@ function init() {
       if (sel && !sel.hasActed) sendIntent({ type: 'wait', unitId: sel.id });
     }
   });
-  document.addEventListener('keyup', (e) => { if (e.key === 'Control') ui.ctrlDown = false; });
 
   window.addEventListener('resize', layoutBoard);
   window.addEventListener('orientationchange', () => setTimeout(layoutBoard, 200));

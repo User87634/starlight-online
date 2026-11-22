@@ -42,11 +42,11 @@
   #turnInfo.A { color: #2563eb; }
   #turnInfo.B { color: #ef4444; }
   #turnInfo.C { color: #22c55e; }
-  #soundBtn, #fullscreenBtn {
+  #soundBtn, #fullscreenBtn, .help-btn {
     background: rgba(255,255,255,.8); border: 1px solid rgba(0,0,0,.1);
     border-radius: 6px; color: #334155; padding: 2px 8px; cursor: pointer; font-size: 12px; font-weight: 600;
   }
-  #soundBtn:hover, #fullscreenBtn:hover { background: #fff; }
+  #soundBtn:hover, #fullscreenBtn:hover, .help-btn:hover { background: #fff; }
 
   #main { flex: 1 1 auto; min-height: 0; display: flex; padding: 6px; gap: 8px; overflow: hidden; }
   #roster {
@@ -264,6 +264,8 @@
   #minimapWrap:hover { transform: scale(1.02); }
   .minimap-title { font-size: 11px; color: #64748b; font-weight: 800; margin-bottom: 4px; letter-spacing: 1px; }
   #minimap { width: 100%; height: auto; aspect-ratio: 25 / 14; border-radius: 4px; border: 1px solid rgba(0,0,0,.1); background: #f8fafc; }
+  
+  /* 全图视野弹窗 */
   #map-modal {
     position: fixed; inset: 0; z-index: 99999; background: rgba(15, 23, 42, 0.7); backdrop-filter: blur(6px);
     display: none; align-items: center; justify-content: center; opacity: 0; transition: opacity 0.2s ease;
@@ -275,28 +277,13 @@
     display: flex; align-items: center; justify-content: center;
   }
   #full-map-canvas { max-width: 100%; max-height: 85vh; aspect-ratio: 25 / 14; border-radius: 6px; border: 1px solid #cbd5e1; display: block; }
+  
   .close-btn {
     position: absolute; top: -14px; right: -14px; background: #ef4444; color: #fff; border: 2px solid #fff;
     width: 32px; height: 32px; border-radius: 50%; display: flex; align-items: center; justify-content: center;
     font-size: 16px; font-weight: bold; cursor: pointer; box-shadow: 0 4px 10px rgba(239, 68, 68, 0.4); transition: transform 0.1s;
   }
   .close-btn:hover { transform: scale(1.05); background: #dc2626; }
-  @media (max-width: 900px), (max-height: 600px) {
-    #main { padding: 2px; gap: 4px; }
-    #roster { flex: 0 0 70px; padding: 3px; gap: 3px; }
-    .roster-icon { width: 24px; height: 24px; }
-    .roster-icon iconify-icon { font-size: 15px; }
-    .roster-name { font-size: 9px; }
-    .roster-hp .dot { width: 4px; height: 4px; }
-    #side { flex: 0 0 180px; padding: 6px; gap: 5px; }
-    #unitInfo { font-size: 11px; }
-    #actions { gap: 4px; }
-    #actions button { padding: 4px 6px; font-size: 10px; }
-    #log { font-size: 9px; }
-    #topbar { flex: 0 0 60px; width: 60px; min-width: 60px; overflow: hidden; gap: 10px; padding: 6px 2px; font-size: 10px; margin-right: 4px; }
-    #topbar b { font-size: 12px; }
-    #topbar button { padding: 2px 4px !important; font-size: 10px !important; }
-  }
 
   /* ============ 大厅样式 ============ */
   #lobby {
@@ -309,6 +296,7 @@
   }
   #lobby.hidden { display: none; }
   .lobby-card {
+    position: relative;
     background: rgba(255,255,255,.85); border: 1px solid rgba(255,255,255,.9);
     border-radius: 16px; padding: 32px 28px; max-width: 420px; width: 100%;
     box-shadow: 0 20px 40px -10px rgba(37, 99, 235, 0.25);
@@ -362,7 +350,20 @@
   .slot-row .empty { color: #94a3b8; flex: 1; font-style: italic; }
   .slot-row .offline { color: #f59e0b; font-size: 11px; font-weight: 700; }
   .slot-row button { padding: 4px 10px !important; font-size: 11px !important; }
-    #sideToolbar { display: flex; gap: 6px; flex-shrink: 0; }
+
+  /* 大厅说明按钮 */
+  .lobby-help-btn {
+    position: absolute; top: 16px; right: 16px;
+    width: 30px; height: 30px; border-radius: 50%;
+    background: #f1f5f9; border: 1px solid #cbd5e1; color: #64748b;
+    font-size: 16px; font-weight: bold; cursor: pointer;
+    display: flex; align-items: center; justify-content: center;
+    transition: all .15s;
+  }
+  .lobby-help-btn:hover { background: #e2e8f0; color: #0f172a; }
+
+  /* 侧边栏与性能面板 */
+  #sideToolbar { display: flex; gap: 6px; flex-shrink: 0; }
   #sideToolbar button {
     flex: 1; padding: 5px 8px; border-radius: 6px;
     background: #fff; color: #475569; border: 1px solid rgba(0,0,0,.1);
@@ -370,7 +371,6 @@
     transition: all .12s;
   }
   #sideToolbar button:hover { background: #fee2e2; color: #ef4444; border-color: #fca5a5; }
-
   #perfPanel {
     position: fixed; right: 8px; bottom: 8px;
     background: rgba(15, 23, 42, 0.75); color: #e2e8f0;
@@ -384,6 +384,43 @@
   #perfPanel b { color: #4ade80; font-weight: 800; }
   #perfPanel b.warn { color: #fbbf24; }
   #perfPanel b.bad { color: #ef4444; }
+
+  /* 游戏说明弹窗 */
+  #help-modal {
+    position: fixed; inset: 0; z-index: 100000; background: rgba(15, 23, 42, 0.7); backdrop-filter: blur(6px);
+    display: none; align-items: center; justify-content: center; opacity: 0; transition: opacity 0.2s ease;
+  }
+  #help-modal.show { display: flex; opacity: 1; }
+  .help-modal-content {
+    position: relative; background: #fff; padding: 24px; border-radius: 12px;
+    box-shadow: 0 20px 40px rgba(0,0,0,0.3); width: 90vw; max-width: 600px; max-height: 85vh;
+    display: flex; flex-direction: column;
+  }
+  .help-modal-content h2 { margin: 0 0 16px; font-size: 20px; text-align: center; color: #1e293b; }
+  .help-body { overflow-y: auto; font-size: 13px; line-height: 1.6; color: #334155; padding-right: 8px; }
+  .help-body h3 { font-size: 15px; color: #2563eb; margin: 16px 0 8px; border-bottom: 1px solid #e2e8f0; padding-bottom: 4px; }
+  .help-body ul { padding-left: 20px; margin: 0 0 12px; }
+  .help-body li { margin-bottom: 6px; }
+  .help-body b { color: #0f172a; }
+  .help-body::-webkit-scrollbar { width: 6px; }
+  .help-body::-webkit-scrollbar-thumb { background: #cbd5e1; border-radius: 3px; }
+
+  @media (max-width: 900px), (max-height: 600px) {
+    #main { padding: 2px; gap: 4px; }
+    #roster { flex: 0 0 70px; padding: 3px; gap: 3px; }
+    .roster-icon { width: 24px; height: 24px; }
+    .roster-icon iconify-icon { font-size: 15px; }
+    .roster-name { font-size: 9px; }
+    .roster-hp .dot { width: 4px; height: 4px; }
+    #side { flex: 0 0 180px; padding: 6px; gap: 5px; }
+    #unitInfo { font-size: 11px; }
+    #actions { gap: 4px; }
+    #actions button { padding: 4px 6px; font-size: 10px; }
+    #log { font-size: 9px; }
+    #topbar { flex: 0 0 60px; width: 60px; min-width: 60px; overflow: hidden; gap: 10px; padding: 6px 2px; font-size: 10px; margin-right: 4px; }
+    #topbar b { font-size: 12px; }
+    #topbar button { padding: 2px 4px !important; font-size: 10px !important; }
+  }
 </style>
 </head>
 <body>
@@ -391,6 +428,7 @@
 <!-- ============ 大厅 ============ -->
 <div id="lobby">
   <div class="lobby-card">
+    <button id="lobbyHelpBtn" class="lobby-help-btn">?</button>
     <h1>星辉秘境 · 三分天下</h1>
     <p class="subtitle">联机版 v1.0</p>
     <div id="lobbyBody">
@@ -431,12 +469,13 @@
       <span id="labelC">敌(C) <b id="scoreC">0</b></span>
       <button id="soundBtn">🔊 音效</button>
       <button id="fullscreenBtn">⛶ 全屏</button>
+      <button id="gameHelpBtn" class="help-btn">❓ 说明</button>
     </div>
     <div id="boardWrap">
       <div id="boardViewport"><div id="board"></div></div>
     </div>
     <div id="side">
-            <div id="sideToolbar">
+      <div id="sideToolbar">
         <button id="exitBtn">🚪 退出游戏</button>
       </div>
       <div id="unitInfo">选择一名英雄行动</div>
@@ -449,15 +488,61 @@
     </div>
   </div>
 </div>
+
+<!-- 浮动信息 -->
 <div id="tooltip"></div>
 <div id="perfPanel">
   <span>FPS <b id="fpsVal">--</b></span>
   <span>延迟 <b id="pingVal">--</b>ms</span>
 </div>
+
+<!-- 全图视野弹窗 -->
 <div id="map-modal">
   <div class="map-modal-content">
     <button class="close-btn" id="closeMapBtn">✖</button>
     <canvas id="full-map-canvas" width="1250" height="700"></canvas>
+  </div>
+</div>
+
+<!-- 游戏说明弹窗（独立在外面，不能嵌套在 map-modal 里） -->
+<div id="help-modal">
+  <div class="help-modal-content">
+    <button class="close-btn" id="closeHelpBtn">✖</button>
+    <h2>星辉秘境 · 游戏说明</h2>
+    <div class="help-body">
+      <h3>🗺️ 地形与机制</h3>
+      <ul>
+        <li><b>幽暗密林</b>：可通行。躲在里面的单位具有隐蔽效果，<b>只能被贴身（相邻1格）攻击</b>，无法被远程锁定。</li>
+        <li><b>秘境阻隔</b>：不可通行。会阻挡移动路线和直线技能（如龙枪的贯穿）。</li>
+        <li><b>星辉圣坛</b>：己方回合开始+1分。<b>高级圣坛</b>：+2分（全场产出 60 分后坍缩）。</li>
+        <li><b>虚空裂隙</b>：踏入后随机传送到安全空地，并<b>强制结束行动</b>。</li>
+        <li><b>中立之泉</b>：回合开始时站在上面可恢复 1 点生命（共 10 次）。</li>
+      </ul>
+
+      <h3>🏆 得分与获胜条件</h3>
+      <ul>
+        <li><b>得分</b>：回合开始控制圣坛得分；每击杀一名敌方英雄，立即获得 +3 分。</li>
+        <li><b>获胜</b>：率先获得 150 分；或全歼敌军。</li>
+      </ul>
+
+      <h3>⚔️ 职业与技能</h3>
+      <ul>
+        <li><b>盾卫</b>：满血未移动时首次免伤（被击退可破盾）。</li>
+        <li><b>弓手</b>：未移动时射程+1，不能攻击相邻敌人。</li>
+        <li><b>巨剑</b>：生命≥3时，横扫周围最多3名敌人。</li>
+        <li><b>影刃</b>：移动无视ZOC，攻击命中致残目标。</li>
+        <li><b>龙枪</b>：生命≥3时，直线贯穿2格。</li>
+        <li><b>符文</b>：生命≥3时，相邻占点，普攻附带击退。</li>
+        <li><b>祭司</b>：生命≥3时，治疗相邻友军并解除致残。</li>
+      </ul>
+
+      <h3>❤️ 残血机制 (属性衰减)</h3>
+      <ul>
+        <li><b>4~3 血</b>：健康状态，技能完好。</li>
+        <li><b>2 血（中伤）</b>：移动力 -1；所有需要“生命≥3”的技能失效。</li>
+        <li><b>1 血（重伤）</b>：移动力强制为1；<b>无法攻击</b>；无法使用技能。</li>
+      </ul>
+    </div>
   </div>
 </div>
 
