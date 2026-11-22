@@ -29,9 +29,17 @@ const MAP_RIFTS = 3;
 const DISCONNECT_GRACE_MS = Number(process.env.DISCONNECT_GRACE_MS) || 60000;
 // 真人回合超时：这么久没有任何操作，就自动驻守结束回合
 const TURN_TIMEOUT_MS = Number(process.env.TURN_TIMEOUT_MS) || 20000;
-// AI 回合节奏：先停顿一下选好棋子，镜头移到位之后再真正行动
-const AI_THINK_MS = Number(process.env.AI_THINK_MS) || 700;
+// AI 回合节奏：轮到 AI 就直接选中要行动的棋子，镜头移到位之后再真正行动
+const AI_THINK_MS = Number(process.env.AI_THINK_MS) || 0;
 const AI_SELECT_PAUSE_MS = Number(process.env.AI_SELECT_PAUSE_MS) || 1100;
+// 前期抢高级圣坛：被指定去抢的人额外加这么多分，保证每回合都优先派他上
+const AI_RUSH_BONUS = 5000;
+// 这回合能直接把某个圣坛抢下来的人，额外加这么多分（拿分第一）
+const AI_CAPTURE_NOW_BONUS = 8000;
+// AI 刚行动过的单位再次被选中时要扣的分（越小越允许连续推进）
+const AI_REPEAT_PENALTY = Number(process.env.AI_REPEAT_PENALTY) || 1200;
+// 原地没挪窝的单位再次被选中时的扣分（相当于这回合换人，防止一个点反复抢）
+const AI_PARKED_PENALTY = 10000;
 
 const TEAM_NAMES = { A: '蓝方', B: '红方', C: '绿方' };
 function teamName(t) { return TEAM_NAMES[t] || t; }
@@ -353,7 +361,8 @@ function scheduleAI(room) {
 
     room.game.aiFocusId = u.id;
     const last = room.game.aiConsecutive[currentTeam];
-    room.game.aiConsecutive[currentTeam] = { id: u.id, count: (last ? last.count : 0) + 1 };
+    // 记下"选中它时它在哪儿"，下次就能判断它是往前走了还是原地没动
+    room.game.aiConsecutive[currentTeam] = { id: u.id, x: u.x, y: u.y, count: (last ? last.count : 0) + 1 };
     broadcast(room);
 
     // 第二拍：镜头到位之后，这枚棋子才真正走位、出手
@@ -737,6 +746,32 @@ function getReachable(game, unit) {
     frontier = next;
   }
   return reach;
+}
+
+// 这回合能不能直接把某个不属于自己的圣坛抢下来
+function canCaptureThisTurn(game, u, currentTeam) {
+  if (!u.alive || u.isCrippled) return false;
+  const here = shrineAt(game, u.x, u.y);
+  if (here && here.owner !== currentTeam) return true;
+  if (u.cls === 'runesmith' && u.hp >= 3) {
+    const adj = game.shrines.some(s => s.owner !== currentTeam &&
+      Math.abs(s.x - u.x) + Math.abs(s.y - u.y) === 1 && !unitAt(game, s.x, s.y));
+    if (adj) return true;
+  }
+  return !!reachableCaptureShrine(game, u, currentTeam);
+}
+
+// 这一回合能走过去直接占领的圣坛（不含自己的；能抢高级圣坛就优先抢高级的）
+function reachableCaptureShrine(game, u, currentTeam) {
+  if (u.isCrippled) return null;
+  const reach = getReachable(game, u);
+  let best = null;
+  for (const s of game.shrines) {
+    if (s.owner === currentTeam) continue;
+    if (!reach.has(key(s.x, s.y))) continue;
+    if (!best || (s.isHigh && !best.isHigh)) best = s;
+  }
+  return best;
 }
 
 function getAttackTargets(game, unit) {
@@ -1255,6 +1290,12 @@ function evaluateBestMove(game, u, currentTeam) {
     const shAt = shrineAt(game, nx, ny);
     if (shAt && shAt.owner !== currentTeam) score += (shAt.isHigh ? 8000 : 1500);
 
+    // 符文匠贴着圣坛站，就能直接把它抢下来：这也是最该去的位置
+    if (u.cls === 'runesmith' && u.hp >= 3) {
+      const adjShrine = unownedShrines.find(s => Math.abs(nx - s.x) + Math.abs(ny - s.y) === 1);
+      if (adjShrine) score += adjShrine.isHigh ? 6000 : 2500;
+    }
+
     let isSafe = true;
     for (const enemy of game.units) {
       if (enemy.alive && enemy.team !== u.team && enemy.isVigilant && enemy.hp === 4) {
@@ -1285,7 +1326,7 @@ function evaluateBestMove(game, u, currentTeam) {
       let maxShrineScore = -Infinity;
       for (const s of unownedShrines) {
         const d = Math.abs(nx - s.x) + Math.abs(ny - s.y);
-        const weight = s.isHigh ? 150 : 30;
+        const weight = s.isHigh ? (s.owner === null ? 300 : 150) : 30;
         maxShrineScore = Math.max(maxShrineScore, (20 - d) * weight);
       }
       score += maxShrineScore;
@@ -1366,7 +1407,10 @@ function evaluateBestMove(game, u, currentTeam) {
     const isShrineAfter = shAt2 && shAt2.owner !== currentTeam;
     u.x = ox; u.y = oy;
 
-    if (canAttackAfter || isShrineAfter) shouldMove = true;
+    // 这回合有圣坛可以占，就别磨蹭
+    const shrineReachable = unownedShrines.some(s => reach.has(key(s.x, s.y)));
+
+    if (canAttackAfter || isShrineAfter || shrineReachable) shouldMove = true;
     else if (currentInDanger) shouldMove = true;
     else if (bestScore > baseScore + 40) shouldMove = true;
   }
@@ -1378,6 +1422,15 @@ function evaluateBestMove(game, u, currentTeam) {
 function aiAfterMove(game, u, currentTeam) {
   const sh = shrineAt(game, u.x, u.y);
   if (sh && sh.owner !== currentTeam) return doCapture(game, u, sh);
+
+  // 符文匠的看家本领是"站在旁边就能占"：走完这一步只要贴着圣坛，照样占下来
+  // （坛上站着敌人就先打人，抢了也守不住）
+  if (u.cls === 'runesmith' && u.hp >= 3) {
+    const adj = game.shrines.find(s => s.owner !== currentTeam &&
+      Math.abs(s.x - u.x) + Math.abs(s.y - u.y) === 1 && !unitAt(game, s.x, s.y));
+    if (adj) return doCapture(game, u, adj);
+  }
+
   const targets = getAttackTargets(game, u);
   if (targets.length > 0) return doAttack(game, u, pickBest(game, targets));
   return doWait(game, u);
@@ -1391,13 +1444,26 @@ function aiActivate(game, u, currentTeam) {
   const sh = shrineAt(game, u.x, u.y);
   if (sh && sh.owner !== currentTeam) return doCapture(game, u, sh);
 
-  // 2. 符文相邻占点
+  // 2. 符文相邻占点（坛上站着敌人就别急着抢，先把他打下来，否则抢了也会被抢回去）
   if (u.cls === 'runesmith' && u.hp >= 3) {
-    const adj = game.shrines.find(s => s.owner !== currentTeam && Math.abs(s.x - u.x) + Math.abs(s.y - u.y) === 1);
+    const adj = game.shrines.find(s => s.owner !== currentTeam &&
+      Math.abs(s.x - u.x) + Math.abs(s.y - u.y) === 1 && !unitAt(game, s.x, s.y));
     if (adj) return doCapture(game, u, adj);
   }
 
-  // 3. 攻击（含特殊技能）
+  // 3. 拿分优先：这一回合能走过去占点，就先占点
+  //    （除非能直接打死人：击杀 +3 分，比占点更值）
+  const enemyTargets = getAttackTargets(game, u);
+  const canKill = enemyTargets.some(t => t.hp === 1);
+  if (!canKill) {
+    const capShrine = reachableCaptureShrine(game, u, currentTeam);
+    if (capShrine) {
+      const mv = doMove(game, u, capShrine.x, capShrine.y);
+      if (!mv.error && !mv.needsTurnEnd) return doCapture(game, u, capShrine);
+    }
+  }
+
+  // 4. 攻击（含特殊技能）
   const targets = getAttackTargets(game, u);
   if (targets.length > 0) {
     let shouldAttack = false, bestTarget = null;
@@ -1455,13 +1521,13 @@ function aiActivate(game, u, currentTeam) {
     }
   }
 
-  // 4. 治疗
+  // 5. 治疗
   if (u.cls === 'priest' && u.hp >= 3) {
     const allies = game.units.filter(a => a.alive && a.team === u.team && a !== u && a.hp < 4 && Math.abs(a.x - u.x) + Math.abs(a.y - u.y) === 1);
     if (allies.length > 0) { allies.sort((a, b) => a.hp - b.hp); return doHeal(game, u, allies[0]); }
   }
 
-  // 5. 移动
+  // 6. 移动
   const { bestMove, shouldMove } = evaluateBestMove(game, u, currentTeam);
   if (bestMove && shouldMove) {
     const moveRes = doMove(game, u, bestMove.x, bestMove.y);
@@ -1479,6 +1545,31 @@ function pickAIActor(game, currentTeam) {
   if (alive.length === 0) return null;
 
   const unownedShrines = game.shrines.filter(s => s.owner !== currentTeam);
+
+  // 高级圣坛还中立时，指定一个人"专程去抢"：全队里离它最近的那个
+  const highShrine = game.shrines.find(s => s.isHigh && s.owner === null) || null;
+  let rusherId = null;
+  if (highShrine) {
+    let bestD = Infinity;
+    for (const u of alive) {
+      const d = Math.abs(u.x - highShrine.x) + Math.abs(u.y - highShrine.y);
+      if (d < bestD) { bestD = d; rusherId = u.id; }
+    }
+  }
+
+  // 预计算：每个单位离"能抢的圣坛"有多值得去，以及这回合能不能直接把坛子抢下来
+  const shrineValue = new Map();
+  const canCaptureNow = new Map();
+  for (const u of alive) {
+    let best = -Infinity;
+    for (const s of unownedShrines) {
+      const d = Math.abs(u.x - s.x) + Math.abs(u.y - s.y);
+      const v = (s.isHigh ? 900 : 300) - d * 40;
+      if (v > best) best = v;
+    }
+    shrineValue.set(u.id, best === -Infinity ? 0 : best);
+    canCaptureNow.set(u.id, canCaptureThisTurn(game, u, currentTeam));
+  }
 
   alive.sort((a, b) => {
     let scoreA = 0, scoreB = 0;
@@ -1502,9 +1593,23 @@ function pickAIActor(game, currentTeam) {
       if (['shield', 'greatsword', 'spear', 'shadow'].includes(b.cls)) scoreB += (15 - (Math.abs(b.x - threatPos.x) + Math.abs(b.y - threatPos.y))) * 200;
     }
 
-    // 【修复】刚刚动过的单位，分数大幅降低，逼它换别人上！
-    if (last.id === a.id) scoreA -= 10000;
-    if (last.id === b.id) scoreB -= 10000;
+    // 前期抢点：被指定去抢高级圣坛的人优先上场，每回合都往那边压
+    if (a.id === rusherId) scoreA += AI_RUSH_BONUS;
+    if (b.id === rusherId) scoreB += AI_RUSH_BONUS;
+
+    // 刚行动过的单位：
+    //  - 原地没动的（在同一个点反复抢），当作"换个人上"，扣到不可能再被选中
+    //  - 真往前推进的，只是稍微靠后；正在抢高级圣坛的那个人完全不受限
+    if (last.id === a.id) {
+      if (last.x === a.x && last.y === a.y) scoreA -= AI_PARKED_PENALTY;
+      else if (a.id === rusherId) scoreA -= 0;
+      else scoreA -= AI_REPEAT_PENALTY;
+    }
+    if (last.id === b.id) {
+      if (last.x === b.x && last.y === b.y) scoreB -= AI_PARKED_PENALTY;
+      else if (b.id === rusherId) scoreB -= 0;
+      else scoreB -= AI_REPEAT_PENALTY;
+    }
 
     // 【补丁】鼓励未行动的机动单位先走，别全挤在老家
     if (a.hasMovedThisRound) scoreA -= 1000;
@@ -1525,15 +1630,11 @@ function pickAIActor(game, currentTeam) {
     if (getAttackTargets(game, a).length > 0) scoreA += 1500;
     if (getAttackTargets(game, b).length > 0) scoreB += 1500;
 
-    let distA = 999, distB = 999;
-    if (!a.isCrippled && a.hp > 1) {
-      unownedShrines.forEach(s => { distA = Math.min(distA, (Math.abs(a.x - s.x) + Math.abs(a.y - s.y)) * (s.isHigh ? 100 : 30)); });
-      scoreA += (3000 - distA);
-    }
-    if (!b.isCrippled && b.hp > 1) {
-      unownedShrines.forEach(s => { distB = Math.min(distB, (Math.abs(b.x - s.x) + Math.abs(b.y - s.y)) * (s.isHigh ? 100 : 30)); });
-      scoreB += (3000 - distB);
-    }
+    // 离能抢的圣坛越近越该先上；这回合就能抢下来的，直接加一大笔
+    if (!a.isCrippled && a.hp > 1) scoreA += shrineValue.get(a.id) || 0;
+    if (!b.isCrippled && b.hp > 1) scoreB += shrineValue.get(b.id) || 0;
+    if (canCaptureNow.get(a.id)) scoreA += AI_CAPTURE_NOW_BONUS;
+    if (canCaptureNow.get(b.id)) scoreB += AI_CAPTURE_NOW_BONUS;
 
     return scoreB - scoreA;
   });
